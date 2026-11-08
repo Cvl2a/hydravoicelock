@@ -1,0 +1,464 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gerar o projeto Android
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'HYDRA_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.hydra.voicelock"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.hydra.voicelock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'HYDRA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="HydraVoiceLock"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".PinActivity" android:exported="false" />
+
+                  <service
+                      android:name=".VoiceService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+
+                  <receiver
+                      android:name=".HydraAdmin"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/Commands.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/Commands.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import java.text.Normalizer
+
+          /**
+           * Todos os comandos comecam com a palavra "hydra" (evita acionar sem querer).
+           *  hydra trancar | hydra emergencia | hydra abrir <app> | hydra liberar
+           */
+          object Commands {
+              private const val WAKE = "hydra"
+
+              private fun norm(s: String) =
+                  Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
+
+              fun handle(ctx: Context, raw: String): Boolean {
+                  val t = norm(raw)
+                  if (!t.contains(WAKE)) return false
+                  val cmd = t.substringAfter(WAKE).trim()
+                  return when {
+                      cmd.startsWith("trancar") || cmd.startsWith("bloquear") -> { lock(ctx); true }
+                      cmd.startsWith("emergencia") || cmd.startsWith("socorro") -> {
+                          Store.closeGate(ctx); lock(ctx); true
+                      }
+                      cmd.startsWith("abrir ") -> openApp(ctx, cmd.removePrefix("abrir ").trim())
+                      cmd.startsWith("liberar") -> {
+                          ctx.startActivity(Intent(ctx, PinActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          true
+                      }
+                      else -> false
+                  }
+              }
+
+              private fun lock(ctx: Context) {
+                  val dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                  if (dpm.isAdminActive(ComponentName(ctx, HydraAdmin::class.java))) dpm.lockNow()
+              }
+
+              private fun openApp(ctx: Context, name: String): Boolean {
+                  val pm = ctx.packageManager
+                  val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val app = pm.queryIntentActivities(launcher, 0)
+                      .firstOrNull { norm(it.loadLabel(pm).toString()).contains(name) } ?: return false
+                  val i = pm.getLaunchIntentForPackage(app.activityInfo.packageName) ?: return false
+                  ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  return true
+              }
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/HydraAdmin.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/HydraAdmin.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.app.admin.DeviceAdminReceiver
+
+          class HydraAdmin : DeviceAdminReceiver()
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/MainActivity.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/MainActivity.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 40, 40, 40)
+                  }
+                  fun btn(label: String, action: () -> Unit) {
+                      col.addView(Button(this).apply {
+                          text = label
+                          setOnClickListener { action() }
+                      })
+                  }
+
+                  col.addView(TextView(this).apply {
+                      text = "HydraVoiceLock\n\nComandos:\n- hydra trancar\n- hydra emergência\n- hydra abrir <app>\n- hydra liberar (pede PIN)"
+                      textSize = 16f
+                  })
+
+                  btn("1. Permitir microfone e notificações") {
+                      val perms = if (Build.VERSION.SDK_INT >= 33)
+                          arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                      else arrayOf(Manifest.permission.RECORD_AUDIO)
+                      requestPermissions(perms, 1)
+                  }
+                  btn("2. Ativar administrador (para trancar)") {
+                      startActivity(
+                          Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                              .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this, HydraAdmin::class.java))
+                              .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Necessário para trancar a tela por voz.")
+                      )
+                  }
+                  btn("3. Permitir exibir sobre outros apps (abrir apps por voz)") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  btn("4. Definir PIN") {
+                      fun save() = askPin("Novo PIN (mínimo 4 dígitos)") {
+                          if (it.length >= 4) { Store.setPin(this, it); toast("PIN salvo") } else toast("PIN muito curto")
+                      }
+                      if (Store.hasPin(this)) {
+                          askPin("PIN atual") { if (Store.verify(this, it, false)) save() else toast("PIN incorreto") }
+                      } else save()
+                  }
+                  btn("5. Iniciar escuta") {
+                      if (!Store.hasPin(this)) toast("Defina o PIN primeiro")
+                      else startForegroundService(Intent(this, VoiceService::class.java))
+                  }
+                  btn("6. Parar escuta (pede PIN)") {
+                      askPin("PIN para parar") {
+                          if (Store.verify(this, it, false)) stopService(Intent(this, VoiceService::class.java))
+                          else toast("PIN incorreto ou bloqueado")
+                      }
+                  }
+                  setContentView(col)
+              }
+
+              private fun askPin(title: String, ok: (String) -> Unit) {
+                  val e = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                  }
+                  AlertDialog.Builder(this).setTitle(title).setView(e)
+                      .setPositiveButton("OK") { _, _ -> ok(e.text.toString()) }
+                      .show()
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/PinActivity.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/PinActivity.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.app.Activity
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.Toast
+
+          class PinActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 27) setShowWhenLocked(true)
+                  val box = EditText(this).apply {
+                      hint = "PIN"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                  }
+                  val btn = Button(this).apply {
+                      text = "Liberar"
+                      setOnClickListener {
+                          if (Store.verify(this@PinActivity, box.text.toString(), true)) {
+                              Toast.makeText(this@PinActivity, "Liberado por 5 min", Toast.LENGTH_SHORT).show()
+                              finish()
+                          } else {
+                              Toast.makeText(this@PinActivity, "PIN incorreto ou bloqueado", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 48, 48, 48)
+                      addView(box)
+                      addView(btn)
+                  })
+              }
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/Store.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/Store.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.content.Context
+          import java.security.MessageDigest
+          import java.util.UUID
+
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("hydra", Context.MODE_PRIVATE)
+
+              private fun hash(pin: String, salt: String): String =
+                  MessageDigest.getInstance("SHA-256").digest((salt + pin).toByteArray())
+                      .joinToString("") { "%02x".format(it) }
+
+              fun hasPin(c: Context) = p(c).contains("pin")
+
+              fun setPin(c: Context, pin: String) {
+                  val salt = UUID.randomUUID().toString()
+                  p(c).edit().putString("salt", salt).putString("pin", hash(pin, salt)).apply()
+              }
+
+              /** Confere o PIN. 5 erros = bloqueio de 60s. Se openGate, libera o "portao" por 5 min. */
+              fun verify(c: Context, pin: String, openGate: Boolean): Boolean {
+                  val now = System.currentTimeMillis()
+                  val sp = p(c)
+                  if (now < sp.getLong("blockedUntil", 0)) return false
+                  val ok = hash(pin, sp.getString("salt", "") ?: "") == sp.getString("pin", null)
+                  val e = sp.edit()
+                  if (ok) {
+                      e.putInt("fails", 0)
+                      if (openGate) e.putLong("gateUntil", now + 5 * 60_000)
+                  } else {
+                      val f = sp.getInt("fails", 0) + 1
+                      if (f >= 5) { e.putInt("fails", 0); e.putLong("blockedUntil", now + 60_000) }
+                      else e.putInt("fails", f)
+                  }
+                  e.apply()
+                  return ok
+              }
+
+              /** Gancho para o futuro: hydrafonevpn e apps protegidos consultam isso. */
+              fun gateOpen(c: Context) = System.currentTimeMillis() < p(c).getLong("gateUntil", 0)
+
+              fun closeGate(c: Context) = p(c).edit().putLong("gateUntil", 0).apply()
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/hydra/voicelock/VoiceService.kt')"
+          cat > 'app/src/main/java/com/hydra/voicelock/VoiceService.kt' <<'HYDRA_EOF'
+          package com.hydra.voicelock
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+
+          class VoiceService : Service() {
+              private var recognizer: SpeechRecognizer? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var running = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("hydra", "HydraVoiceLock", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = Notification.Builder(this, "hydra")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("HydraVoiceLock ouvindo")
+                      .setContentText("Diga: hydra trancar")
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  running = true
+                  listen()
+                  return START_STICKY
+              }
+
+              private fun listen() {
+                  if (!running) return
+                  recognizer?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(results: Bundle?) {
+                          results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              ?.firstOrNull { Commands.handle(this@VoiceService, it) }
+                          restart()
+                      }
+                      override fun onError(error: Int) = restart()
+                      override fun onReadyForSpeech(params: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(partialResults: Bundle?) {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+                  })
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+                      putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                      putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                  }
+                  recognizer = r
+                  r.startListening(i)
+              }
+
+              private fun restart() {
+                  handler.postDelayed({ listen() }, 700)
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  super.onDestroy()
+              }
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/device_admin.xml')"
+          cat > 'app/src/main/res/xml/device_admin.xml' <<'HYDRA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies>
+                  <force-lock />
+              </uses-policies>
+          </device-admin>
+          HYDRA_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'HYDRA_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          HYDRA_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'HYDRA_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          HYDRA_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'HYDRA_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "HydraVoiceLock"
+          include(":app")
+          HYDRA_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HydraVoiceLock-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publicar APK em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1-${{ github.run_number }}
+          name: HydraVoiceLock build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
